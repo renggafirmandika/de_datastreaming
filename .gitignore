@@ -2,6 +2,7 @@ de_assignment2/
 env/
 *.venv
 .env
+DATA/
 
 # Python
 __pycache__/
