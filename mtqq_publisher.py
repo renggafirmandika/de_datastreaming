@@ -10,7 +10,7 @@ BROKER = "localhost"
 PORT = 1883
 TOPIC = "COMP5339/T07G04/facilities"
 
-df = pd.read_csv("DATA/EXTRACTED/consolidated_facilities_cleaned.csv")
+
 
 # define what happens upon connection to the server
 def on_connect(client, userdata, connect_flags, reason_code, properties):
@@ -60,8 +60,10 @@ def stop_mtqq_client():
     client.loop_stop()
     client.disconnect()
 
+if "__name__"=="__main__":
+    initialise_mqtt_client()
+    publish_data_stream(df)
+    stop_mtqq_client()
 
-initialise_mqtt_client()
-publish_data_stream(df)
-stop_mtqq_client()
+
 
