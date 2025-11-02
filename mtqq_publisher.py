@@ -70,10 +70,13 @@ def publish_data_stream(df:pd.DataFrame):
                     "timestamp": r["timestamp"].isoformat() if pd.notna(r["timestamp"]) else None,                      # ensure str/ISO if datetime
                     "facility_code": r["facility_code"],
                     "facility_name": r.get("facility_name"),
+                    "fuel_type": r.get("fuel_type"),
                     "lat": float(r["lat"]) if not pd.isna(r.get("lat")) else None,
                     "lng": float(r["lng"]) if not pd.isna(r.get("lng")) else None,
                     "power": None if pd.isna(r.get("power")) else float(r["power"]),
                     "emissions": None if pd.isna(r.get("emissions")) else float(r["emissions"]),
+                    "demand_energy": None if pd.isna(r.get("demand_energy")) else float(r["demand_energy"]),
+                    "price": None if pd.isna(r.get("price")) else float(r["price"]),
                 }
             
                 message = json.dumps(payload)
