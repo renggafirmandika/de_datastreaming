@@ -67,10 +67,11 @@ def publish_data_stream(df:pd.DataFrame):
 
             for _, r in day_data.iterrows():
                 payload = {
-                    "timestamp": r["timestamp"].isoformat() if pd.notna(r["timestamp"]) else None,                      # ensure str/ISO if datetime
+                    "timestamp": r["timestamp"].isoformat() if pd.notna(r["timestamp"]) else None,  # ensure str/ISO if datetime
                     "facility_code": r["facility_code"],
                     "facility_name": r.get("facility_name"),
                     "fuel_type": r.get("fuel_type"),
+                    "network_region": r.get("network_region"),
                     "lat": float(r["lat"]) if not pd.isna(r.get("lat")) else None,
                     "lng": float(r["lng"]) if not pd.isna(r.get("lng")) else None,
                     "power": None if pd.isna(r.get("power")) else float(r["power"]),
@@ -81,7 +82,8 @@ def publish_data_stream(df:pd.DataFrame):
             
                 message = json.dumps(payload)
                 client.publish(TOPIC, message)
-                print(f"[PUBLISHED] {r['facility_code']} @ {r['timestamp']}")
+                # log includes region so you can verify it's not UNKNOWN
+                print(f"[PUBLISHED] {r['facility_code']} @ {r['timestamp']} (region={payload['network_region']}, fuel={payload['fuel_type']})")
 
                 time.sleep(0.1)
         
@@ -110,9 +112,3 @@ def publish_via_mqtt_broker(data:pd.DataFrame):
         print("\n\nStopping publisher...")
         stop_mtqq_client()
         print("Disconnected from MQTT broker")
-        
-
-
-
-
-
