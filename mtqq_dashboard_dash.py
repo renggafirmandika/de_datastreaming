@@ -2,6 +2,11 @@ import json
 import threading
 from collections import defaultdict
 from datetime import datetime
+import queue
+import duckdb
+import pandas as pd
+from datetime import timedelta
+import time
 
 import paho.mqtt.client as mqtt
 from dash import Dash, html, dcc, Input, Output, State
@@ -10,10 +15,20 @@ import plotly.graph_objects as go
 # MQTT Config
 BROKER = "broker.hivemq.com"
 PORT = 1883
-TOPIC = "COMP5339/T07G04/facilities"
+FACILITY_TOPIC = "COMP5339/T07G04/facilities"
+MARKET_TOPIC = "COMP5339/T07G04/market"
+
+TIME_BUCKET_MINUTES = 5
+
+facility_queue = queue.Queue()
+market_queue = queue.Queue()
+
+facility_buckets = defaultdict(lambda: defaultdict(dict))  
+market_buckets = defaultdict(lambda: defaultdict(dict))
 
 # Global state storage for latest facility readings
 facilities_data = {}
+facilities_metadata = {}
 mqtt_connected = False
 
 # Fuel type standardization
@@ -40,6 +55,28 @@ def normalize_fuel(val) -> str:
     s = str(val).strip()
     key = s.lower().replace(" ", "")
     return FUEL_CANONICALS.get(key, s)
+
+def get_data_from_db():
+    con = duckdb.connect("energy_dw.duckdb", read_only=True)
+
+    facilities_metadata_df = con.execute("""
+        SELECT 
+            facility_code,
+            facility_name,
+            network_region as region,
+            lat,
+            lng,
+            fuel_type
+        FROM facility_opennem_mapping
+    """).df()
+
+    metadata = facilities_metadata_df.set_index('facility_code').to_dict('index')
+
+    print(f"✓ Loaded {len(metadata)} facilities from Database")
+    
+    con.close()
+
+    return metadata
 
 # Marker colors by fuel type
 FUEL_COLORS = {
@@ -80,34 +117,25 @@ def on_connect(client, userdata, flags, reason_code, properties=None):
     global mqtt_connected
     mqtt_connected = (reason_code == 0)
     if mqtt_connected:
-        client.subscribe(TOPIC)
-        print(f"Connected to MQTT broker and subscribed to {TOPIC}")
+        client.subscribe([
+            (FACILITY_TOPIC, 1),
+            (MARKET_TOPIC, 1)
+        ])
+        print(f"✓ Successfully connected to MQTT broker and subscribed to:")
+        print(f"   - {FACILITY_TOPIC}")
+        print(f"   - {MARKET_TOPIC}\n")
     else:
-        print(f"Failed to connect. rc={reason_code}")
+        print(f"✗ Failed to connect. rc={reason_code}")
 
 def on_message(client, userdata, message):
     """Handle incoming MQTT messages and store latest reading per facility."""
     try:
-        p = json.loads(message.payload.decode("utf-8"))
-        code = p.get("facility_code")
-        if not code:
-            return
+        payload = json.loads(message.payload.decode())
+        if message.topic == FACILITY_TOPIC:
+            facility_queue.put(payload)
+        elif message.topic == MARKET_TOPIC:
+            market_queue.put(payload)
 
-        fuel = normalize_fuel(p.get("fuel_type"))
-
-        facilities_data[code] = {
-            "facility_code": code,
-            "facility_name": p.get("facility_name"),
-            "network_region": p.get("network_region"),
-            "fuel_type": fuel,
-            "lat": p.get("lat"),
-            "lng": p.get("lng"),
-            "power": p.get("power") or 0.0,
-            "emissions": p.get("emissions") or 0.0,
-            "demand_energy": p.get("demand_energy") or 0.0,
-            "price": p.get("price") or 0.0,
-            "timestamp": p.get("timestamp"),
-        }
     except Exception as e:
         print(f"on_message error: {e}")
 
@@ -125,6 +153,108 @@ def start_mqtt_once():
         return
     start_mqtt_once._started = True
     threading.Thread(target=_mqtt_loop, daemon=True).start()
+
+def round_to_bucket(timestamp_str):
+    ts = pd.to_datetime(timestamp_str)
+    minutes = (ts.minute // TIME_BUCKET_MINUTES) * TIME_BUCKET_MINUTES
+    bucket = ts.replace(minute=minutes, second=0, microsecond=0)
+    return bucket.isoformat()
+
+def integrate_data_sources():
+    """Process queued MQTT messages and integrate with database metadata."""
+    global facilities_data, facilities_metadata
+    
+    facility_processed = 0
+    market_processed = 0
+
+    # Process market data first
+    while not market_queue.empty():
+        try:
+            msg = market_queue.get_nowait()
+            bucket = round_to_bucket(msg['timestamp'])
+            region = msg['region']
+
+            market_buckets[bucket][region] = {
+                'price': msg['price'],
+                'demand_energy': msg['demand_energy'],
+                'timestamp': msg['timestamp']
+            }
+            market_processed += 1
+        except queue.Empty:
+            break
+        except Exception as e:
+            print(f"Error processing market data: {e}")
+
+    # Process facility data
+    while not facility_queue.empty():
+        try:
+            msg = facility_queue.get_nowait()
+            facility_code = msg['facility_code']
+
+            # Check if we have metadata for this facility
+            if facility_code not in facilities_metadata:
+                continue
+
+            metadata = facilities_metadata[facility_code]
+            region = metadata['region']
+
+            bucket = round_to_bucket(msg['timestamp'])
+
+            # Try to find matching market data
+            market_data = market_buckets.get(bucket, {}).get(region, {})
+
+            if not market_data:
+                prev_bucket = (pd.to_datetime(bucket) - 
+                              timedelta(minutes=TIME_BUCKET_MINUTES)).isoformat()
+                market_data = market_buckets.get(prev_bucket, {}).get(region, {})
+
+            integrated_record = {
+                # From MQTT Facilities
+                'facility_code': facility_code,
+                'power': msg['power'],
+                'emissions': msg['emissions'],
+                'timestamp': msg['timestamp'],
+                'time_bucket': bucket,
+                
+                # From Database
+                'facility_name': metadata['facility_name'],
+                'network_region': region,
+                'lat': metadata['lat'],
+                'lng': metadata['lng'],
+                'fuel_type': metadata['fuel_type'],
+                
+                # From MQTT Market
+                'price': market_data.get('price'),
+                'demand_energy': market_data.get('demand_energy'),
+                'market_timestamp': market_data.get('timestamp'),
+                
+                # Data quality
+                'has_market_data': bool(market_data)
+            }
+            
+            facilities_data[facility_code] = integrated_record
+            facility_processed += 1
+        
+        except queue.Empty:
+            break
+        except Exception as e:
+            print(f"Error integrating facility data: {e}")
+
+    # Only log if data was processed
+    if facility_processed > 0 or market_processed > 0:
+        print(f"✓ Processed: {facility_processed} facilities, {market_processed} market updates | Total facilities: {len(facilities_data)}")
+
+    return facility_processed, market_processed
+
+def process_queues_continuously():
+    """Background thread to continuously process MQTT queues."""
+    while True:
+        try:
+            integrate_data_sources()
+            time.sleep(1)  # Process every second
+        except Exception as e:
+            print(f"Error in queue processing: {e}")
+            time.sleep(5)
 
 # Dash App
 app = Dash(__name__)
@@ -312,13 +442,13 @@ def update_map(_, view_mode, region_sel, fuel_sel, relayout, map_state):
     def metric_value(r):
         reg = r.get("network_region")
         if view_mode == "power":
-            return float(r.get("power") or 0.0)                    # facility-level
+            return float(r.get("power") or 0.0)
         elif view_mode == "emissions":
-            return float(r.get("emissions") or 0.0)                # facility-level
+            return float(r.get("emissions") or 0.0)
         elif view_mode == "demand_energy":
-            return float(latest_by_region.get(reg, {}).get("demand", 0.0))  # region-level
+            return float(latest_by_region.get(reg, {}).get("demand", 0.0))
         else:  # price
-            return float(latest_by_region.get(reg, {}).get("price", 0.0))   # region-level
+            return float(latest_by_region.get(reg, {}).get("price", 0.0))
 
     # Scale marker sizes
     MIN_SIZE, MAX_SIZE = 15, 30
@@ -408,7 +538,19 @@ def update_map(_, view_mode, region_sel, fuel_sel, relayout, map_state):
 
     return fig, stats, map_state
 
+
 # Run app
 if __name__ == "__main__":
+    # Load metadata once at startup
+    print("Loading facility metadata from database...")
+    facilities_metadata = get_data_from_db()
+    
+    # Start MQTT connection
     start_mqtt_once()
-    app.run(host="0.0.0.0", port=8050, debug=False, use_reloader=False)
+    
+    # Start background queue processor
+    print("Starting background data processor...")
+    threading.Thread(target=process_queues_continuously, daemon=True).start()
+    
+    print("\n✓ Dashboard starting on http://0.0.0.0:8051\n")
+    app.run(host="0.0.0.0", port=8052, debug=False, use_reloader=False)

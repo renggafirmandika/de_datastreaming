@@ -4,6 +4,7 @@ import json
 import sys
 import pandas as pd
 
+from dotenv import load_dotenv
 
 # MQTT Config
 # broker.hivemq.com is a public MQTT broker. 
@@ -11,12 +12,12 @@ import pandas as pd
 BROKER = "broker.hivemq.com"
 #BROKER = "localhost"
 PORT = 1883
-TOPIC = "COMP5339/T07G04/facilities"
+FACILITY_TOPIC = "COMP5339/T07G04/facilities"
+MARKET_TOPIC = "COMP5339/T07G04/market"
 
 # define what happens upon connection to the server
 def on_connect(client, userdata, connect_flags, reason_code, properties):
     print("Connected with result code " + str(reason_code))
-    print(f"Ready to publish to topic: {TOPIC}")
 
 # setup client
 client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
@@ -67,7 +68,7 @@ def publish_data_stream(df:pd.DataFrame):
 
             for _, r in day_data.iterrows():
                 payload = {
-                    "timestamp": r["timestamp"].isoformat() if pd.notna(r["timestamp"]) else None,  # ensure str/ISO if datetime
+                    "timestamp": r["timestamp"].isoformat() if pd.notna(r["timestamp"]) else None,  
                     "facility_code": r["facility_code"],
                     "facility_name": r.get("facility_name"),
                     "fuel_type": r.get("fuel_type"),
@@ -81,8 +82,8 @@ def publish_data_stream(df:pd.DataFrame):
                 }
             
                 message = json.dumps(payload)
-                client.publish(TOPIC, message)
-                # log includes region so you can verify it's not UNKNOWN
+                client.publish(FACILITY_TOPIC, message)
+                
                 print(f"[PUBLISHED] {r['facility_code']} @ {r['timestamp']} (region={payload['network_region']}, fuel={payload['fuel_type']})")
 
                 time.sleep(0.1)
@@ -93,21 +94,89 @@ def publish_data_stream(df:pd.DataFrame):
             print(f"Waiting 60 seconds before next day's data...")
             time.sleep(60)
 
+def publish_combined(facility_df, market_df):
+    print(f"Loaded {len(facility_df)} facility records")
+    print(f"Loaded {len(market_df)} market records")
+
+    facility_df = facility_df.copy()
+    market_df = market_df.copy()
+
+    facility_df['record_type'] = 'facility'
+    market_df['record_type'] = 'market'
+
+    all_data = pd.concat([
+        facility_df[['timestamp', 'record_type', 'facility_code', 'power', 'emissions']],
+        market_df[['timestamp', 'record_type', 'network_region', 'price', 'demand_energy']]
+    ], ignore_index=True)
+
+    all_data = all_data.sort_values('timestamp').reset_index(drop=True)
+
+    iteration = 0
+
+    while True:
+        iteration += 1
+
+        facility_count = 0
+        market_count = 0
+
+        for idx, row in all_data.iterrows():
+            if row['record_type'] == 'facility':
+                payload = {
+                    "facility_code": row['facility_code'],
+                    "power": float(row['power']) if pd.notna(row['power']) else None,
+                    "emissions": float(row['emissions']) if pd.notna(row['emissions']) else None,
+                    "timestamp": str(row['timestamp'])
+                }
+                
+                client.publish(FACILITY_TOPIC, json.dumps(payload), qos=1)
+                print(f"[PUBLISHED] Facility data: {row['facility_code']} @ {row['timestamp']}")
+                facility_count += 1
+            else: 
+                payload = {
+                    "region": row['network_region'],
+                    "price": float(row['price']) if pd.notna(row['price']) else None,
+                    "demand_energy": float(row['demand_energy']) if pd.notna(row['demand_energy']) else None,
+                    "timestamp": str(row['timestamp'])
+                }
+                
+                topic = f"{MARKET_TOPIC}/{row['network_region']}"
+                client.publish(topic, json.dumps(payload), qos=1, retain=True)
+                print(f"[PUBLISHED] Market data: {row['network_region']} @ {row['timestamp']}")
+                market_count += 1
+            
+            total = facility_count + market_count
+
+            if total % 1000 == 0:
+                print(f"Published {total}/{len(all_data)} records...")
+
+            time.sleep(0.1)
+
+        print(f"Facilities published: {facility_count}")
+        print(f"Market published: {market_count}")
+        print(f"Total: {facility_count + market_count}")
+
+        time.sleep(60)
+
 # function to stop the MQTT client
 def stop_mtqq_client():
     client.loop_stop()
     client.disconnect()
 
 # full pipeline
-def publish_via_mqtt_broker(data:pd.DataFrame):
-    df = data
+def publish_via_mqtt_broker(fac_data:pd.DataFrame, mar_data:pd.DataFrame):
+    facility_df = fac_data
+    market_df = mar_data
 
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    facility_df['timestamp'] = pd.to_datetime(facility_df['timestamp'], utc=True)
+    market_df['timestamp'] = pd.to_datetime(market_df['timestamp'], utc=True)
+
+    facility_df['timestamp'] = facility_df['timestamp'].dt.tz_convert('Australia/Sydney')
+    market_df['timestamp'] = market_df['timestamp'].dt.tz_convert('Australia/Sydney')
     print("Starting continuous data stream publisher...")
 
     try:
         initialise_mqtt_client()
-        publish_data_stream(df)
+        publish_combined(facility_df, market_df)
     except KeyboardInterrupt:
         print("\n\nStopping publisher...")
         stop_mtqq_client()
